@@ -1,0 +1,280 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Recreates WorkSpaces under a new (Managed AD) directory after AD objects have been migrated. WorkSpaces cannot be moved across directories (migrate-workspace changes bundle/OS only, same directory), so each WorkSpace is recreated in the target directory. For each user, the SOURCE WorkSpace (in sourceDirectoryId) is READ to discover the bundle it currently uses, and the new WorkSpace is created with that same bundle (unless bundleIdOverride is set). This document is CREATE-ONLY: it reads the source WorkSpaces but NEVER terminates or modifies them. Decommissioning the old Simple AD WorkSpaces is a deliberate, manual, customer-owned step done after validation. This document does NOT copy user data. dryRun defaults to true.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "targetDirectoryId": {
+      "type": "String",
+      "description": "(Required) The Managed AD directory ID already registered with WorkSpaces (d-xxxxxxxxxx) that new WorkSpaces will be created in.",
+      "allowedPattern": "^d-[0-9a-f]{10}$"
+    },
+    "sourceDirectoryId": {
+      "type": "String",
+      "description": "(Required) The SOURCE directory ID (d-xxxxxxxxxx) whose WorkSpaces are being migrated. Read-only: used to look up each user's existing WorkSpace and its bundle. This document never terminates or modifies anything in this directory.",
+      "allowedPattern": "^d-[0-9a-f]{10}$"
+    },
+    "userList": {
+      "type": "StringList",
+      "description": "(Required) List of AD usernames (sAMAccountName) to recreate under the target directory. These must already exist in the target Managed AD. Batched 25 per create-workspaces call.",
+      "allowedPattern": "^[^\\\\/:*?\"<>|@]{1,20}$",
+      "default": []
+    },
+    "bundleIdOverride": {
+      "type": "String",
+      "description": "(Optional) If set, use this bundle for ALL recreated WorkSpaces instead of inheriting each user's source bundle. Also used as the fallback bundle for users who have no source WorkSpace. Leave empty to inherit each user's source WorkSpace bundle per-user.",
+      "allowedPattern": "^$|^wsb-[0-9a-z]{8,63}$",
+      "default": ""
+    },
+    "runningMode": {
+      "type": "String",
+      "description": "(Optional) WorkSpace running mode for the recreated WorkSpaces.",
+      "default": "AUTO_STOP",
+      "allowedValues": [
+        "AUTO_STOP",
+        "ALWAYS_ON"
+      ]
+    },
+    "dryRun": {
+      "type": "String",
+      "description": "(Optional) If true, only report the plan (what would be created, with resolved per-user bundles) without calling create-workspaces.",
+      "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "autoRequestQuotaIncrease": {
+      "type": "String",
+      "description": "(Optional) Default false. If the WorkSpaces service quota (L-34278094) in this region has too few free slots for this run, the QuotaCheck step ALWAYS fails closed and prints the exact 'aws service-quotas request-service-quota-increase' command for an operator to run. A quota increase is asynchronous and approval-gated (it opens a support case), so it can NEVER be satisfied within this run. If this is set to true, the automation additionally FILES the increase request on your behalf (RequestServiceQuotaIncrease) and reports the CaseId, but still fails the run because the new limit will not be approved in time. This files a cost-impacting support case on the account, so it is off by default and must be explicitly opted into.",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role that allows Systems Manager Automation to perform actions on your behalf. Needs workspaces:DescribeWorkspaces/DescribeWorkspaceDirectories/CreateWorkspaces/DescribeTags and ds:DescribeDirectories, plus servicequotas:GetServiceQuota/GetAWSDefaultServiceQuota/ListRequestedServiceQuotaChangeHistoryByQuota for the WorkSpaces quota preflight (and servicequotas:RequestServiceQuotaIncrease only if autoRequestQuotaIncrease=true). Does NOT need workspaces:TerminateWorkspaces (this document never terminates). Leave empty to run as the invoking identity.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "Preconditions",
+      "action": "aws:executeScript",
+      "description": "Validate the target directory is registered with WorkSpaces and source != target.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "targetDirectoryId": "{{ targetDirectoryId }}",
+          "sourceDirectoryId": "{{ sourceDirectoryId }}"
+        },
+        "Script": "import boto3\ndef handler(event, context):\n    ws = boto3.client('workspaces')\n    did = event['targetDirectoryId']\n    sid = event['sourceDirectoryId']\n    if did == sid:\n        raise Exception('sourceDirectoryId and targetDirectoryId must differ (%s).' % did)\n    dirs = ws.describe_workspace_directories(DirectoryIds=[did]).get('Directories', [])\n    if not dirs:\n        raise Exception('Target directory %s is not registered with WorkSpaces. Register it first.' % did)\n    state = dirs[0].get('State')\n    if state not in ('REGISTERED', 'REGISTERING'):\n        raise Exception('Target directory %s state is %s; expected REGISTERED.' % (did, state))\n    return {'directoryState': state, 'ok': True}"
+      },
+      "outputs": [
+        {
+          "Name": "ok",
+          "Selector": "$.Payload.ok",
+          "Type": "Boolean"
+        }
+      ]
+    },
+    {
+      "name": "BuildPlan",
+      "action": "aws:executeScript",
+      "description": "Read-only: resolve each user's SOURCE WorkSpace (scoped to sourceDirectoryId) and preserve its bundle AND properties (compute type, root/user volume sizes, volume encryption + KMS key, non-aws tags) so the recreated WorkSpace matches the source instead of silently dropping encryption and resizing to bundle defaults (#4). Bundle precedence: bundleIdOverride if set, else the user's single source bundle. Users with no source WorkSpace (and no override) are SKIPPED and reported; multiple differing source bundles are reported AMBIGUOUS and skipped; users already in the target are skipped (idempotency). When created from bundleIdOverride with no source WorkSpace, encryption/sizing fall back to bundle defaults and the plan flags encryption=bundle-default. Nothing is created or terminated here.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "targetDirectoryId": "{{ targetDirectoryId }}",
+          "sourceDirectoryId": "{{ sourceDirectoryId }}",
+          "userList": "{{ userList }}",
+          "bundleIdOverride": "{{ bundleIdOverride }}",
+          "runningMode": "{{ runningMode }}"
+        },
+        "Script": "import boto3\ndef handler(event, context):\n    ws = boto3.client('workspaces')\n    users = event.get('userList') or []\n    # (#19) aws:executeScript output payload is limited (~100 KB); plan/skipped scale with userList.\n    # Cap the per-run user list so the step output stays well under the limit (also consistent with the\n    # <=25 create cap). Split larger migrations into multiple runs.\n    if len(users) > 100:\n        raise Exception('userList has %d entries; the maximum supported per run is 100 (SSM executeScript output payload limit). Split into batches of 100 or fewer.' % len(users))\n    sid = event['sourceDirectoryId']\n    did = event['targetDirectoryId']\n    override = (event.get('bundleIdOverride') or '').strip()\n    rm = event['runningMode']\n    pag = ws.get_paginator('describe_workspaces')\n    # Source map: username -> full source WorkSpace record(s), scoped to the source directory.\n    src = {}\n    for page in pag.paginate(DirectoryId=sid):\n        for w in page['Workspaces']:\n            u = w.get('UserName')\n            src.setdefault(u, {'bundles': set(), 'ws': []})\n            src[u]['bundles'].add(w.get('BundleId'))\n            src[u]['ws'].append(w)\n    tgt = set()\n    for page in pag.paginate(DirectoryId=did):\n        for w in page['Workspaces']:\n            tgt.add(w.get('UserName'))\n    plan = []\n    createRequests = []\n    skipped = []\n    for u in users:\n        info = src.get(u)\n        if u in tgt:\n            plan.append({'UserName': u, 'action': 'skip-exists-in-target'})\n            skipped.append({'UserName': u, 'reason': 'already has a WorkSpace in target directory'})\n            continue\n        bundle = None\n        reason = None\n        srcWs = None\n        if info:\n            bundles = sorted(b for b in info['bundles'] if b)\n            srcWs = info['ws'][0]\n            if override:\n                bundle = override\n            elif len(bundles) == 1:\n                bundle = bundles[0]\n            elif len(bundles) > 1:\n                reason = 'ambiguous: multiple source bundles %s (set bundleIdOverride)' % bundles\n            else:\n                reason = 'source WorkSpace has no resolvable bundle (set bundleIdOverride)'\n        elif override:\n            bundle = override\n        else:\n            reason = 'no source WorkSpace found in %s (set bundleIdOverride to create anyway)' % sid\n        if bundle:\n            # #4: preserve source WorkSpace properties (encryption, KMS key, volume sizes,\n            # compute type, tags). Without this the recreated WorkSpace silently drops volume\n            # encryption and resizes to bundle defaults. If there is no source WorkSpace (override\n            # path) we fall back to bundle defaults and flag it.\n            props = {'RunningMode': rm}\n            encHint = 'bundle-default'\n            tags = []\n            if srcWs:\n                sp = srcWs.get('WorkspaceProperties', {})\n                # (#18) When an override bundle is set, let the override bundle govern compute/volume sizing.\n                # Copying source ComputeTypeName/RootVolumeSizeGib/UserVolumeSizeGib onto a different override\n                # bundle can produce an invalid size for that bundle and fail the create.\n                if not override:\n                    if sp.get('ComputeTypeName'):\n                        props['ComputeTypeName'] = sp['ComputeTypeName']\n                    if sp.get('RootVolumeSizeGib'):\n                        props['RootVolumeSizeGib'] = sp['RootVolumeSizeGib']\n                    if sp.get('UserVolumeSizeGib'):\n                        props['UserVolumeSizeGib'] = sp['UserVolumeSizeGib']\n                req = {'DirectoryId': did, 'UserName': u, 'BundleId': bundle, 'WorkspaceProperties': props}\n                vek = srcWs.get('VolumeEncryptionKey')\n                if vek:\n                    req['VolumeEncryptionKey'] = vek\n                    req['RootVolumeEncryptionEnabled'] = bool(srcWs.get('RootVolumeEncryptionEnabled', True))\n                    req['UserVolumeEncryptionEnabled'] = bool(srcWs.get('UserVolumeEncryptionEnabled', True))\n                    encHint = 'encrypted(%s)' % vek\n                # (#17) carry source tags. describe_tags needs workspaces:DescribeTags; do NOT swallow an\n                # AccessDenied (that would silently drop tags). Surface a clear permissions error; only a\n                # genuinely empty TagList means no tags.\n                try:\n                    t = ws.describe_tags(ResourceId=srcWs['WorkspaceId']).get('TagList', [])\n                    tags = [x for x in t if not x.get('Key','').startswith('aws:')]\n                except ws.exceptions.ClientError as e:\n                    code = e.response.get('Error', {}).get('Code', '')\n                    if code in ('AccessDeniedException', 'AccessDenied', 'UnauthorizedOperation'):\n                        raise Exception('describe_tags AccessDenied for %s: automation role is missing workspaces:DescribeTags. Add it to the policy and retry.' % srcWs['WorkspaceId'])\n                    raise\n                if tags:\n                    req['Tags'] = tags\n            else:\n                req = {'DirectoryId': did, 'UserName': u, 'BundleId': bundle, 'WorkspaceProperties': props}\n            createRequests.append(req)\n            plan.append({'UserName': u, 'action': 'create', 'bundleId': bundle, 'bundleSource': 'override' if override else 'source', 'encryption': encHint, 'compute': props.get('ComputeTypeName','bundle-default'), 'tagsCarried': len(tags)})\n        else:\n            plan.append({'UserName': u, 'action': 'skip', 'reason': reason})\n            skipped.append({'UserName': u, 'reason': reason})\n    # (25-ID cap) DescribeWorkspaces / aws:waitForAwsResourceProperty accept at most 25 WorkspaceIds.\n    # This orchestrator waits by WorkspaceIds, so a single run must create at most 25 WorkSpaces.\n    if len(createRequests) > 25:\n        raise Exception('This run would create %d WorkSpaces; the maximum supported per run is 25 (DescribeWorkspaces WorkspaceIds limit). Split the user list into batches of 25 or fewer.' % len(createRequests))\n    # (fae0bb03) Order/empty-directory guard. If the caller asked for users but NOTHING is creatable\n    # and nothing was skipped because it already exists in the target, every user failed to resolve\n    # (no source WorkSpace and no bundleIdOverride) - the usual symptom of running this document before\n    # the AD migration populated the target directory, or against the wrong directory. Fail closed\n    # rather than silently produce an empty plan.\n    already = [s for s in skipped if 'already has a WorkSpace in target' in (s.get('reason') or '')]\n    if users and not createRequests and not already:\n        raise Exception('No WorkSpaces can be created for any of the %d requested user(s) and none already exist in the target directory. This usually means the AD migration has not populated the target directory yet, or the documents are being run out of order / against the wrong directory. Resolve the users in the target Managed AD first (or set bundleIdOverride intentionally), then re-run. Skips: %s' % (len(users), skipped))\n    return {'plan': plan, 'createRequests': createRequests, 'skipped': skipped, 'toCreateCount': len(createRequests), 'skippedCount': len(skipped), 'userCount': len(users)}"
+      },
+      "outputs": [
+        {
+          "Name": "plan",
+          "Selector": "$.Payload.plan",
+          "Type": "MapList"
+        },
+        {
+          "Name": "createRequests",
+          "Selector": "$.Payload.createRequests",
+          "Type": "MapList"
+        },
+        {
+          "Name": "skipped",
+          "Selector": "$.Payload.skipped",
+          "Type": "MapList"
+        },
+        {
+          "Name": "toCreateCount",
+          "Selector": "$.Payload.toCreateCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "skippedCount",
+          "Selector": "$.Payload.skippedCount",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "QuotaCheck",
+      "action": "aws:executeScript",
+      "description": "WorkSpaces service-quota preflight. Reads the applied WorkSpaces quota (L-34278094) in this region, counts the CURRENT region-wide WorkSpaces, and compares (current + toCreateCount) against the limit. The quota is REGION-WIDE (not per-directory), so a near-full region fails create-workspaces mid-batch and leaves a partial migration; this step fails closed BEFORE any create. On insufficient quota it prints the exact 'aws service-quotas request-service-quota-increase' command and reports any already-pending increase request. A quota increase is asynchronous and approval-gated (opens a support case) so it can never be satisfied within this run. If autoRequestQuotaIncrease=true it also files the increase (RequestServiceQuotaIncrease) and reports the CaseId, but STILL fails the run. Read-only unless autoRequestQuotaIncrease=true. Does not count the per-bundle GraphicsPro/Graphics.g4dn sub-quotas (L-254B485B/L-BCACAEBC/L-BE9A8466), which have their own limits; flagged as a known limitation.",
+      "onFailure": "Abort",
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "targetDirectoryId": "{{ targetDirectoryId }}",
+          "toCreateCount": "{{ BuildPlan.toCreateCount }}",
+          "autoRequestQuotaIncrease": "{{ autoRequestQuotaIncrease }}"
+        },
+        "Script": "import boto3\ndef handler(event, context):\n    toCreate = int(event.get('toCreateCount') or 0)\n    autoReq = (str(event.get('autoRequestQuotaIncrease') or 'false').lower() == 'true')\n    QUOTA_CODE = 'L-34278094'  # WorkSpaces (per region); verified via list-service-quotas service-code=workspaces\n    region = boto3.session.Session().region_name\n    sq = boto3.client('service-quotas')\n    ws = boto3.client('workspaces')\n    # Resolve the applied limit; fall back to the AWS default if no account-applied override exists.\n    limit = None\n    try:\n        limit = sq.get_service_quota(ServiceCode='workspaces', QuotaCode=QUOTA_CODE)['Quota']['Value']\n    except sq.exceptions.NoSuchResourceException:\n        limit = sq.get_aws_default_service_quota(ServiceCode='workspaces', QuotaCode=QUOTA_CODE)['Quota']['Value']\n    limit = int(limit)\n    # Count CURRENT region-wide WorkSpaces (the quota is regional, across all directories).\n    current = 0\n    for page in ws.get_paginator('describe_workspaces').paginate():\n        current += len(page.get('Workspaces', []))\n    available = limit - current\n    needed = toCreate\n    result = {'region': region, 'quotaCode': QUOTA_CODE, 'limit': limit, 'current': current, 'available': available, 'toCreate': needed}\n    if needed <= 0:\n        result['status'] = 'ok-nothing-to-create'\n        return result\n    # Look for an already-pending increase request so we don't tell the operator to file a duplicate.\n    desired = current + needed\n    pending = None\n    try:\n        hist = sq.list_requested_service_quota_change_history_by_quota(ServiceCode='workspaces', QuotaCode=QUOTA_CODE).get('RequestedQuotas', [])\n        for r in hist:\n            if r.get('Status') in ('PENDING', 'CASE_OPENED') and float(r.get('DesiredValue', 0)) >= desired:\n                pending = {'Id': r.get('Id'), 'CaseId': r.get('CaseId'), 'DesiredValue': r.get('DesiredValue'), 'Status': r.get('Status')}\n                break\n    except Exception as e:\n        result['pendingCheckWarning'] = 'could not read change history: %s' % str(e)\n    cmd = ('aws service-quotas request-service-quota-increase --service-code workspaces '\n           '--quota-code %s --desired-value %d --region %s') % (QUOTA_CODE, desired, region)\n    if needed <= available:\n        result['status'] = 'ok'\n        if available - needed <= max(1, int(limit * 0.1)):\n            result['warning'] = ('This run fits but will leave only %d free WorkSpaces slot(s) of %d (>=90%% utilization after creating %d). Consider requesting an increase: %s' % (available - needed, limit, needed, cmd))\n        return result\n    # Insufficient quota -> fail closed.\n    result['status'] = 'insufficient'\n    result['requiredLimit'] = desired\n    result['remediationCommand'] = cmd\n    if pending:\n        result['pendingRequest'] = pending\n    filed = None\n    if autoReq and not pending:\n        try:\n            resp = sq.request_service_quota_increase(ServiceCode='workspaces', QuotaCode=QUOTA_CODE, DesiredValue=float(desired))\n            rq = resp.get('RequestedQuota', {})\n            filed = {'Id': rq.get('Id'), 'CaseId': rq.get('CaseId'), 'DesiredValue': rq.get('DesiredValue'), 'Status': rq.get('Status')}\n            result['increaseRequestFiled'] = filed\n        except Exception as e:\n            result['increaseRequestError'] = str(e)\n    # Build the failure message.\n    msg = ('WorkSpaces quota preflight FAILED: region %s has %d of %d WorkSpaces used; this run needs %d but only %d slot(s) are free. '\n           'Request a WorkSpaces limit increase (quota %s) to at least %d, then re-run. Command: %s') % (region, current, limit, needed, available, QUOTA_CODE, desired, cmd)\n    if pending:\n        msg += ' NOTE: an increase to %s is already %s (request %s); wait for it to be approved rather than filing another.' % (pending.get('DesiredValue'), pending.get('Status'), pending.get('Id'))\n    elif filed:\n        msg += ' An increase request to %d was filed on your behalf (request %s, case %s); it is approval-gated and will NOT be effective in this run. Re-run after it is approved.' % (desired, filed.get('Id'), filed.get('CaseId'))\n    raise Exception(msg)"
+      },
+      "outputs": [
+        {
+          "Name": "status",
+          "Selector": "$.Payload.status",
+          "Type": "String"
+        },
+        {
+          "Name": "limit",
+          "Selector": "$.Payload.limit",
+          "Type": "Integer"
+        },
+        {
+          "Name": "current",
+          "Selector": "$.Payload.current",
+          "Type": "Integer"
+        },
+        {
+          "Name": "available",
+          "Selector": "$.Payload.available",
+          "Type": "Integer"
+        }
+      ]
+    },
+    {
+      "name": "DryRunGate",
+      "action": "aws:branch",
+      "description": "If dryRun=true, stop at the plan. Otherwise proceed to create.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "CreateWorkspaces",
+            "Variable": "{{ dryRun }}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "PlanOnlyComplete"
+      }
+    },
+    {
+      "name": "CreateWorkspaces",
+      "action": "aws:executeScript",
+      "description": "Create the recreated WorkSpaces in the target directory with each user's resolved bundle, batched 25 per call. Reports FailedRequests per user. Non-idempotent: not retried automatically to avoid duplicate WorkSpaces.",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "inputs": {
+        "Runtime": "python3.11",
+        "Handler": "handler",
+        "InputPayload": {
+          "createRequests": "{{ BuildPlan.createRequests }}"
+        },
+        "Script": "import boto3\ndef handler(event, context):\n    ws = boto3.client('workspaces')\n    reqs = event.get('createRequests', [])\n    created, failed = [], []\n    for i in range(0, len(reqs), 25):\n        batch = reqs[i:i+25]\n        resp = ws.create_workspaces(Workspaces=batch)\n        for r in resp.get('PendingRequests', []):\n            created.append({'UserName': r.get('UserName'), 'WorkspaceId': r.get('WorkspaceId'), 'State': r.get('State')})\n        for fr in resp.get('FailedRequests', []):\n            wr = fr.get('WorkspaceRequest', {})\n            failed.append({'UserName': wr.get('UserName'), 'ErrorCode': fr.get('ErrorCode'), 'ErrorMessage': fr.get('ErrorMessage')})\n    return {'created': created, 'failed': failed, 'createdCount': len(created), 'failedCount': len(failed), 'createdIds': [c['WorkspaceId'] for c in created if c.get('WorkspaceId')]}"
+      },
+      "outputs": [
+        {
+          "Name": "created",
+          "Selector": "$.Payload.created",
+          "Type": "MapList"
+        },
+        {
+          "Name": "failed",
+          "Selector": "$.Payload.failed",
+          "Type": "MapList"
+        },
+        {
+          "Name": "createdCount",
+          "Selector": "$.Payload.createdCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "failedCount",
+          "Selector": "$.Payload.failedCount",
+          "Type": "Integer"
+        },
+        {
+          "Name": "createdIds",
+          "Selector": "$.Payload.createdIds",
+          "Type": "StringList"
+        }
+      ]
+    },
+    {
+      "name": "CreatedGate",
+      "action": "aws:branch",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "RecreateComplete",
+            "Variable": "{{ CreateWorkspaces.createdCount }}",
+            "NumericEquals": 0
+          }
+        ],
+        "Default": "WaitAllReady"
+      }
+    },
+    {
+      "name": "WaitAllReady",
+      "action": "aws:waitForAwsResourceProperty",
+      "timeoutSeconds": 3600,
+      "onFailure": "Abort",
+      "inputs": {
+        "Service": "workspaces",
+        "Api": "DescribeWorkspaces",
+        "PropertySelector": "$.Workspaces..State",
+        "DesiredValues": [
+          "AVAILABLE",
+          "STOPPED"
+        ],
+        "WorkspaceIds": "{{ CreateWorkspaces.createdIds }}"
+      },
+      "nextStep": "RecreateComplete"
+    },
+    {
+      "name": "RecreateComplete",
+      "action": "aws:sleep",
+      "description": "WorkSpaces recreate wave complete. The source (Simple AD) WorkSpaces are untouched; decommission them manually after validating the new WorkSpaces and copying off any user data.",
+      "inputs": {
+        "Duration": "PT1S"
+      },
+      "isEnd": true
+    },
+    {
+      "name": "PlanOnlyComplete",
+      "action": "aws:sleep",
+      "description": "Dry run complete. Review BuildPlan output (resolved per-user bundles and any skipped users); re-run with dryRun=false to execute.",
+      "inputs": {
+        "Duration": "PT1S"
+      },
+      "isEnd": true
+    }
+  ],
+  "outputs": [
+    "BuildPlan.plan",
+    "BuildPlan.skipped",
+    "CreateWorkspaces.created",
+    "CreateWorkspaces.failed"
+  ]
+}

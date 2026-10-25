@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadMigrationSecret",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<region>:<account-id>:secret:ad-migration/credentials-*"
+    },
+    {
+      "Sid": "KmsDecryptForSecretOnlyIfCMK",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "arn:aws:kms:<region>:<account-id>:key/<cmk-key-id>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.<region>.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "MigrationParams",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/ad-migration/*"
+    },
+    {
+      "Sid": "ResolveTargetDirectory",
+      "Effect": "Allow",
+      "Action": "ds:DescribeDirectories",
+      "Resource": "arn:aws:ds:<region>:<account-id>:directory/<directory-id>"
+    }
+  ]
+}

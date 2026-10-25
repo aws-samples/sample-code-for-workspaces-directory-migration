@@ -1,0 +1,312 @@
+{
+  "schemaVersion": "0.3",
+  "description": "Authors a go-forward Group Policy Object in the TARGET AWS Managed Microsoft AD that maps each migrated user's Amazon FSx for Windows File Server home folder (\\\\<fsxDnsName>\\<shareName>\\%username%) as a drive, and optionally redirects Documents/Desktop to it. This is the dataStrategy=fsx go-forward path for the Simple AD -> Managed AD WorkSpaces migration: user data lives on the FSx share so future WorkSpace recreates no longer lose data. IMPORTANT MECHANISM: GPO authoring in Managed AD cannot be done as the Run Command SYSTEM identity (a computer account, which is denied) nor via loopback WinRM (double-hop). It is performed by registering and running a one-shot SCHEDULED TASK as the Managed AD Admin user (interactive-equivalent logon), which is the method verified to work. Credentials come from the AWS Secrets Manager secret (migrationSecretId) target block. This document does NOT create the FSx file system (bring your own, pass its DNS name) and does NOT copy existing data off the old WorkSpaces (that one-time seed is a separate, still-open step). dryRun defaults to true.",
+  "assumeRole": "{{ AutomationAssumeRole }}",
+  "parameters": {
+    "instanceId": {
+      "type": "AWS::EC2::Instance::Id",
+      "description": "(Required) EC2 instance ID of a management box JOINED TO THE TARGET Managed AD domain, with RSAT GroupPolicy module and SSM. GPO authoring must run on a target-domain-joined box (verified: <your-target-joined-mgmt-instance-id> in the reference env)."
+    },
+    "targetDomain": {
+      "type": "String",
+      "description": "(Required) Target Managed AD FQDN (e.g., example.local).",
+      "allowedPattern": "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,}$",
+      "maxChars": 255
+    },
+    "migrationSecretId": {
+      "type": "String",
+      "description": "(Required) Name or ARN of the Secrets Manager secret holding JSON {\"target\":{\"username\",\"password\"}} for the Managed AD Admin used to author the GPO.",
+      "allowedPattern": "^(?:[a-zA-Z0-9/_+=.@-]{1,512}|arn:(?:aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):secretsmanager:[a-z0-9-]{1,30}:[0-9]{12}:secret:[a-zA-Z0-9/_+=.@-]{1,512})$",
+      "maxChars": 2048,
+      "default": "ad-migration/credentials"
+    },
+    "fsxDnsName": {
+      "type": "String",
+      "description": "(Required) DNS name of the EXISTING FSx for Windows file system joined to the target Managed AD (e.g., amznfsxxxxxxxxx.example.local). This document does not create FSx.",
+      "allowedPattern": "^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,}$",
+      "maxChars": 255
+    },
+    "shareName": {
+      "type": "String",
+      "description": "(Optional) The FSx share name that contains per-user home folders. Default 'share'.",
+      "allowedPattern": "^[a-zA-Z0-9._-]{1,80}$",
+      "default": "share"
+    },
+    "driveLetter": {
+      "type": "String",
+      "description": "(Optional) Drive letter to map the user's FSx home folder to (e.g., H:).",
+      "allowedPattern": "^[D-Zd-z]:$",
+      "default": "H:"
+    },
+    "gpoName": {
+      "type": "String",
+      "description": "(Optional) Name of the GPO to create or update in Managed AD. If a GPO of this name already exists AND was authored by this migration (its Description matches the migration comment), it is UPDATED IN PLACE: its existing links are preserved and only the logon-script content this document owns is rewritten. If a GPO of this name exists that was NOT authored by this migration, the document refuses and stops (it will not modify or delete a customer GPO). It never deletes a GPO. Point this at a name the migration owns.",
+      "allowedPattern": "^[a-zA-Z0-9 _.-]{1,120}$",
+      "default": "WS-Migration-FSx-HomeDrive"
+    },
+    "targetOuDn": {
+      "type": "String",
+      "description": "(Required) Distinguished Name of the OU to link the GPO to (e.g., OU=TestUsers,OU=EXAMPLE,DC=example,DC=local). The GPO applies to users under this OU.",
+      "allowedPattern": "^(?:OU|CN)=[A-Za-z0-9 _.-]{1,64}(?:,(?:OU|CN)=[A-Za-z0-9 _.-]{1,64})*,DC=[A-Za-z0-9-]{1,63}(?:,DC=[A-Za-z0-9-]{1,63})+$",
+      "maxChars": 1024
+    },
+    "gpoAuthorGmsa": {
+      "type": "String",
+      "description": "(Required) sAMAccountName of a group Managed Service Account (gMSA), WITHOUT the trailing '$', used as the GPO-authoring identity (e.g., fsxgpo-author). The gMSA must already exist in the target Managed AD, this management box must be allowed to retrieve its password (PrincipalsAllowedToRetrieveManagedPassword) and have it installed locally (Install-ADServiceAccount, verified with Test-ADServiceAccount), and it must be delegated GPO-create/link rights on targetOuDn (and Group Policy Creator Owners / write on the Policies container). Using a gMSA means Task Scheduler retrieves the password from AD at runtime, so NO credential is ever written to the LSA secrets store on this box. AWS Managed Microsoft AD supports gMSA: add the identity creating the gMSA to the 'AWS Delegated Managed Service Account Administrators' group (the Admin account is a member by default) and the KDS root key is managed by AWS. See https://docs.aws.amazon.com/directoryservice/latest/admin-guide/ms_ad_key_concepts_gmsa.html",
+      "allowedPattern": "^[a-zA-Z0-9._-]{1,19}$",
+      "maxChars": 20
+    },
+    "redirectFolders": {
+      "type": "String",
+      "description": "(Optional) RESERVED / NOT YET IMPLEMENTED. Folder redirection (Documents/Desktop to the FSx home folder) is not authored by this document yet; only the home-drive mapping is created. If set to 'true' the document aborts with a clear message rather than silently doing nothing. Leave 'false'.",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "dryRun": {
+      "type": "String",
+      "description": "(Optional) If 'true', validate inputs and report the plan without authoring/linking the GPO.",
+      "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ]
+    },
+    "AutomationAssumeRole": {
+      "type": "AWS::IAM::Role::Arn",
+      "description": "(Optional) The ARN of the IAM role that allows Systems Manager Automation to perform actions on your behalf. Needs ssm:DescribeInstanceInformation/SendCommand/GetCommandInvocation to the instance and secretsmanager:GetSecretValue on the secret. Leave empty to run as the invoking identity.",
+      "default": ""
+    }
+  },
+  "mainSteps": [
+    {
+      "name": "Preflight",
+      "action": "aws:runCommand",
+      "description": "Validate on the target-domain-joined box: GroupPolicy module present, target secret readable with a target block, FSx share reachable over SMB, and the target OU exists. Read-only.",
+      "onFailure": "Abort",
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ instanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$ErrorActionPreference='Stop'",
+            "Write-Host 'FSx-GPO preflight...' -ForegroundColor Cyan",
+            "if (-not (Get-Module -ListAvailable -Name GroupPolicy)) { throw 'GroupPolicy module not found. Install RSAT GPMC (RSAT-Group-Policy-Mgmt-Tools).' }",
+            "$sec = (Get-SECSecretValue -SecretId '{{ migrationSecretId }}' -ErrorAction Stop).SecretString | ConvertFrom-Json",
+            "if (-not $sec.target -or [string]::IsNullOrWhiteSpace($sec.target.username)) { throw 'Secret missing target.username' }",
+            "$isMutating = ('{{ dryRun }}' -eq 'false')",
+            "# (62d4415b) The GPO is authored by a gMSA, so this document no longer uses target.password. Verify the",
+            "# gMSA is installed and usable on THIS box (Test-ADServiceAccount), which is the authoring prerequisite.",
+            "$gmsaName = '{{ gpoAuthorGmsa }}'",
+            "try { $gmsaOk = Test-ADServiceAccount -Identity $gmsaName } catch { $gmsaOk = $false }",
+            "if (-not $gmsaOk) {",
+            "  if ($isMutating) { throw \"gMSA '$gmsaName' is not usable on this box (Test-ADServiceAccount failed). Create the gMSA in the target Managed AD, add this box to its PrincipalsAllowedToRetrieveManagedPassword, run Install-ADServiceAccount, and delegate it GPO create/link rights on the target OU, then re-run. See README.\" }",
+            "  else { Write-Host \"WARNING: gMSA '$gmsaName' not usable on this box yet (dryRun=true, plan only). It MUST pass Test-ADServiceAccount and hold GPO-authoring rights before a dryRun=false run.\" -ForegroundColor Yellow }",
+            "} else { Write-Host \"gMSA usable on this box: $gmsaName\" -ForegroundColor Green }",
+            "$fsxUnc = '\\\\{{ fsxDnsName }}\\{{ shareName }}'",
+            "# (a9f786cf) FAIL-CLOSED share + ACL gate. The GPO maps each user's home drive to",
+            "# <fsxUnc>\\%USERNAME%, but this document deliberately does NOT create or ACL the per-user",
+            "# folders (that stays a customer-owned step). To prevent home-folder SQUATTING, when this is a",
+            "# mutating run (dryRun=false) we must (1) be able to reach the share, and (2) confirm the share",
+            "# root does NOT let Authenticated Users / Everyone create folders (the squatting precondition).",
+            "# On a dry run we only warn, so planning against a not-yet-built share still works.",
+            "$shareReachable = Test-Path $fsxUnc",
+            "if (-not $shareReachable) {",
+            "  if ($isMutating) { throw \"FSx share $fsxUnc is not reachable from this box. Refusing to author a home-drive GPO against an unverifiable share (dryRun=false). Make the share reachable from this management box and re-run, or run with dryRun=true to plan only.\" }",
+            "  else { Write-Host \"WARNING: FSx share $fsxUnc not reachable (dryRun=true, plan only). It MUST be reachable and ACL-checked before a dryRun=false run.\" -ForegroundColor Yellow }",
+            "} else {",
+            "  Write-Host \"FSx share reachable: $fsxUnc\" -ForegroundColor Green",
+            "  # Inspect the share-root ACL for the squatting precondition (open create/write to a broad group).",
+            "  try {",
+            "    $acl = Get-Acl -Path $fsxUnc -ErrorAction Stop",
+            "    $badGroups = @('Everyone','NT AUTHORITY\\Authenticated Users','Authenticated Users','BUILTIN\\Users')",
+            "    $writeRights = @('CreateDirectories','CreateFiles','Write','WriteData','Modify','FullControl','AppendData')",
+            "    $offending = @()",
+            "    foreach ($ace in $acl.Access) {",
+            "      if ($ace.AccessControlType -ne 'Allow') { continue }",
+            "      $idn = $ace.IdentityReference.Value",
+            "      if ($badGroups -contains $idn) {",
+            "        $r = $ace.FileSystemRights.ToString()",
+            "        if ($writeRights | Where-Object { $r -match $_ }) { $offending += \"$idn : $r\" }",
+            "      }",
+            "    }",
+            "    if ($offending.Count -gt 0) {",
+            "      $msg = \"FSx share root $fsxUnc grants create/write to a broad group (home-folder squatting risk). Offending ACE(s): \" + ($offending -join '; ') + \". Remove create/write for Authenticated Users/Everyone at the share root and pre-create each per-user folder owned by that user (see README), then re-run.\"",
+            "      if ($isMutating) { throw $msg } else { Write-Host (\"WARNING (dryRun): \" + $msg) -ForegroundColor Yellow }",
+            "    } else { Write-Host 'Share-root ACL OK (no broad create/write ACE).' -ForegroundColor Green }",
+            "  } catch {",
+            "    if ($isMutating) { throw \"Could not read the FSx share-root ACL at $fsxUnc to verify it against home-folder squatting (dryRun=false). Error: $($_.Exception.Message). Ensure this management box can read the share ACL, then re-run.\" }",
+            "    else { Write-Host \"WARNING (dryRun): could not read share-root ACL at $fsxUnc : $($_.Exception.Message)\" -ForegroundColor Yellow }",
+            "  }",
+            "}",
+            "$ou = Get-ADOrganizationalUnit -Identity '{{ targetOuDn }}' -Server '{{ targetDomain }}' -ErrorAction SilentlyContinue",
+            "if (-not $ou) { throw 'targetOuDn not found in target domain: {{ targetOuDn }}' }",
+            "Write-Host 'Preflight OK' -ForegroundColor Green"
+          ]
+        }
+      }
+    },
+    {
+      "name": "DryRunGate",
+      "action": "aws:branch",
+      "description": "If dryRun=true, stop after preflight (plan only). Otherwise author the GPO.",
+      "inputs": {
+        "Choices": [
+          {
+            "NextStep": "AuthorAndLinkGPO",
+            "Variable": "{{ dryRun }}",
+            "StringEquals": "false"
+          }
+        ],
+        "Default": "PlanOnlyComplete"
+      }
+    },
+    {
+      "name": "AuthorAndLinkGPO",
+      "action": "aws:runCommand",
+      "description": "Author the FSx home-drive GPO in Managed AD and link it to the target OU. The authoring script is written to a per-run directory locked to SYSTEM and Administrators (not the drive root), then executed by a one-shot SCHEDULED TASK running as the Managed AD Admin user (the verified-working logon context; SYSTEM/computer-account and loopback-WinRM both fail). The GPO installs a per-user logon script that maps the FSx home folder (net use <drive> \\\\<fsx>\\<share>\\%USERNAME%) by account name (not SID, so it survives the forest move). The scheduled task, the on-disk script, the result file and the in-memory password are cleaned up in a finally block even if authoring fails. MUTATING (not retried automatically). On re-run it is idempotent for the migration's own GPO: an existing GPO authored by this migration is UPDATED IN PLACE (links preserved, only the owned logon-script content rewritten), a foreign same-name GPO is refused, and a GPO is created only when none exists. It never deletes a GPO. NOTE: this document does NOT pre-create or ACL the per-user FSx folders; see the home-folder squatting note in the article.",
+      "onFailure": "Abort",
+      "maxAttempts": 1,
+      "timeoutSeconds": 600,
+      "inputs": {
+        "DocumentName": "AWS-RunPowerShellScript",
+        "InstanceIds": [
+          "{{ instanceId }}"
+        ],
+        "Parameters": {
+          "commands": [
+            "$ErrorActionPreference='Stop'",
+            "# (#13) redirectFolders is reserved and not implemented yet. Fail loudly rather than silently ignore.",
+            "if ('{{ redirectFolders }}' -eq 'true') { throw 'redirectFolders=true is not implemented in this version. Re-run with redirectFolders=false (home-drive mapping only).' }",
+            "# (62d4415b) GPO authoring runs as a gMSA, NOT the Managed AD Admin with a password. Task Scheduler",
+            "# retrieves the gMSA password from AD at runtime, so no credential is written to the LSA secrets store.",
+            "# The gMSA principal is <NetBIOS>\\<gmsa>$ (trailing $ required). Resolve NetBIOS from AD authoritatively",
+            "# rather than guessing from the FQDN (the NetBIOS name is not always the first DNS label).",
+            "$nb = (Get-ADDomain -Server ('{{ targetDomain }}')).NetBIOSName",
+            "$u = $nb + '\\' + '{{ gpoAuthorGmsa }}' + '$'",
+            "# (#5) Write the authoring script to a per-run directory locked to SYSTEM + Administrators, NOT the",
+            "# drive root. A world-readable .ps1 at C:\\ could be read or replaced (squatting) by any local user",
+            "# before the scheduled task runs it. We create the dir, strip inheritance, and grant only SYSTEM and",
+            "# the local Administrators group, then write the script and result file inside it.",
+            "$workDir = Join-Path $env:ProgramData ('ADWSMig-FsxGpo-' + [guid]::NewGuid().ToString('N'))",
+            "New-Item -ItemType Directory -Path $workDir -Force | Out-Null",
+            "$acl = Get-Acl $workDir",
+            "$acl.SetAccessRuleProtection($true, $false)",
+            "$sys = New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM','FullControl','ContainerInherit,ObjectInherit','None','Allow')",
+            "$adm = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators','FullControl','ContainerInherit,ObjectInherit','None','Allow')",
+            "# (#13) The scheduled task runs as $u (the TARGET-domain admin), which may NOT be a member of the box's",
+            "# local BUILTIN\\Administrators. Grant that exact identity ReadAndExecute so it can read author.ps1 in the",
+            "# inheritance-stripped work dir; without this the locked folder can block the task from reading its script.",
+            "$taskUserAce = New-Object System.Security.AccessControl.FileSystemAccessRule($u,'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')",
+            "$acl.AddAccessRule($sys); $acl.AddAccessRule($adm); $acl.AddAccessRule($taskUserAce)",
+            "Set-Acl -Path $workDir -AclObject $acl",
+            "$resultFile = Join-Path $workDir 'result.txt'",
+            "$scriptFile = Join-Path $workDir 'author.ps1'",
+            "# Build the authoring script as a plain string, substitute the automation params, and write it to the",
+            "# locked .ps1. The scheduled task runs the FILE (-File), avoiding the triple-quoting that corrupts an",
+            "# inline here-string. The GPO uses a per-user LOGON SCRIPT (net use) rather than fragile GPP Drives XML.",
+            "$lines = @()",
+            "$lines += '$ErrorActionPreference = \"Stop\"'",
+            "$lines += ('$rf = \"' + $resultFile + '\"')",
+            "$lines += 'try {'",
+            "$lines += '  Import-Module GroupPolicy'",
+            "$lines += '  $d = \"{{ targetDomain }}\"'",
+            "$lines += '  # Pin ONE DC for the whole create-then-modify sequence (Managed AD has 2 DCs; reading the'",
+            "$lines += '  # new GPC via the domain FQDN can hit the other DC before replication).'",
+            "$lines += '  $dc = (Get-ADDomainController -DomainName $d -Discover -NextClosestSite).HostName | Select-Object -First 1'",
+            "$lines += '  $n = \"{{ gpoName }}\"'",
+            "$lines += '  $old = Get-GPO -Name $n -Domain $d -Server $dc -ErrorAction SilentlyContinue'",
+            "$lines += '  # (c9ce2236) UPDATE-IN-PLACE, do NOT delete-and-recreate. Remove-GPO would drop ALL links the'",
+            "$lines += '  # GPO has (including OUs an admin linked for a wave migration that this document was never told'",
+            "$lines += '  # about) and discard any admin edits. So: if OUR GPO already exists, reuse its Id and only rewrite'",
+            "$lines += '  # the content we own; if a same-name GPO exists that we did NOT author, refuse (do not touch it);'",
+            "$lines += '  # only create a new GPO when none exists. No Remove-GPO anywhere.'",
+            "$lines += '  $reused = $false'",
+            "$lines += '  if ($old) {'",
+            "$lines += '    if ($old.Description -eq \"Simple AD to Managed AD migration: FSx home drive\") { $g = $old; $reused = $true }'",
+            "$lines += '    else { throw \"A GPO named $n already exists and was not created by this migration. Refusing to modify or delete it; choose a different gpoName or remove the existing GPO manually.\" }'",
+            "$lines += '  } else {'",
+            "$lines += '    $g = New-GPO -Name $n -Domain $d -Server $dc -Comment \"Simple AD to Managed AD migration: FSx home drive\"'",
+            "$lines += '  }'",
+            "$lines += '  $gpoId = $g.Id.ToString().ToUpper()'",
+            "$lines += '  $dom = (Get-ADDomain -Server $dc)'",
+            "$lines += '  $drive = \"{{ driveLetter }}\"'",
+            "$lines += '  $unc = \"\\\\{{ fsxDnsName }}\\{{ shareName }}\\%USERNAME%\"'",
+            "$lines += '  $logon = \"net use $drive /delete /y 2>nul`r`nnet use $drive $unc /persistent:yes\"'",
+            "$lines += '  $base = \"\\\\$dc\\SYSVOL\\$d\\Policies\\{$gpoId}\\User\\Scripts\\Logon\"'",
+            "$lines += '  New-Item -ItemType Directory -Path $base -Force | Out-Null'",
+            "$lines += '  Set-Content -Path \"$base\\MapFsxHome.cmd\" -Value $logon -Encoding ASCII'",
+            "$lines += '  $gptUser = \"\\\\$dc\\SYSVOL\\$d\\Policies\\{$gpoId}\\User\\Scripts\\scripts.ini\"'",
+            "$lines += '  $ini = \"[Logon]`r`n0CmdLine=MapFsxHome.cmd`r`n0Parameters=\"'",
+            "$lines += '  Set-Content -Path $gptUser -Value $ini -Encoding Unicode'",
+            "$lines += '  $ext = \"[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]\"'",
+            "$lines += '  # Bind the new GPC directly by its DN on the SAME DC we created it on (a bare Get-ADObject'",
+            "$lines += '  # -Filter does NOT return cn by default, so -Identity <DN> is the reliable, verified bind).'",
+            "$lines += '  $dn = \"CN={$gpoId},CN=Policies,CN=System,\" + $dom.DistinguishedName'",
+            "$lines += '  $obj = $null'",
+            "$lines += '  for ($i=0; $i -lt 12; $i++) {'",
+            "$lines += '    try { $obj = Get-ADObject -Identity $dn -Server $dc -Properties versionNumber,gPCUserExtensionNames; if ($obj) { break } } catch { Start-Sleep -Seconds 5 }'",
+            "$lines += '  }'",
+            "$lines += '  if (-not $obj) { throw \"groupPolicyContainer $dn not found on $dc after retries\" }'",
+            "$lines += '  $obj | Set-ADObject -Server $dc -Replace @{gPCUserExtensionNames=$ext}'",
+            "$lines += '  $cur = [int]$obj.versionNumber'",
+            "$lines += '  $newVer = $cur + 65536'",
+            "$lines += '  $obj | Set-ADObject -Server $dc -Replace @{versionNumber=$newVer}'",
+            "$lines += '  $gpt = \"\\\\$dc\\SYSVOL\\$d\\Policies\\{$gpoId}\\GPT.INI\"'",
+            "$lines += '  if (Test-Path $gpt) { Set-Content -Path $gpt -Value \"[General]`r`nVersion=$newVer\" -Encoding ASCII }'",
+            "$lines += '  $links = (Get-GPInheritance -Target \"{{ targetOuDn }}\" -Domain $d -Server $dc).GpoLinks | Where-Object { $_.DisplayName -eq $n }'",
+            "$lines += '  if (-not $links) { New-GPLink -Name $n -Target \"{{ targetOuDn }}\" -Domain $d -Server $dc -LinkEnabled Yes | Out-Null }'",
+            "$lines += '  \"CREATED/UPDATED id=$gpoId reused=$reused linked={{ targetOuDn }} drive=$drive ver=$newVer\" | Out-File $rf'",
+            "$lines += '} catch { \"FAILED: \" + $_.Exception.Message | Out-File $rf }'",
+            "$script = $lines -join [Environment]::NewLine",
+            "Set-Content -Path $scriptFile -Value $script -Encoding UTF8",
+            "# (#8) Register -> start -> wait -> read, with the scheduled task, on-disk script/result, in-memory",
+            "# password and work dir ALWAYS cleaned up in finally, even if the wait or read throws.",
+            "$taskName = 'FsxGpoAuthor'",
+            "# (62d4415b) The authoring task runs as a gMSA via a ScheduledTaskPrincipal with -LogonType Password.",
+            "# For a gMSA this does NOT take or store a password: Task Scheduler fetches it from AD at runtime, so",
+            "# nothing is persisted to the LSA secrets store. The defensive pre-sweep below clears any stale task.",
+            "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue",
+            "try {",
+            "  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument \"-NoProfile -ExecutionPolicy Bypass -File $scriptFile\"",
+            "  $principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Password -RunLevel Highest",
+            "  Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null",
+            "  Start-ScheduledTask -TaskName $taskName",
+            "  $deadline=(Get-Date).AddSeconds(120)",
+            "  while ((Get-Date) -lt $deadline) { if (Test-Path $resultFile) { break }; Start-Sleep -Seconds 5 }",
+            "  if (Test-Path $resultFile) { $r = (Get-Content $resultFile) -join ' '; Write-Host \"GPO author result: $r\"; if ($r -like 'FAILED*') { throw $r } }",
+            "  else { throw 'GPO authoring task produced no result within timeout (check Admin logon-as-batch rights on the box).' }",
+            "} finally {",
+            "  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue",
+            "  if (Test-Path $workDir) { Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue }",
+            "}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "AuthorComplete",
+      "action": "aws:sleep",
+      "description": "FSx home-drive GPO authored and linked. Run gpupdate on target WorkSpaces (or wait for policy refresh) for users to receive the mapping. Existing-data seed into FSx is a separate, still-open step.",
+      "inputs": {
+        "Duration": "PT1S"
+      }
+    },
+    {
+      "name": "PlanOnlyComplete",
+      "action": "aws:sleep",
+      "description": "Dry run complete. Review preflight output; re-run with dryRun=false to author and link the GPO.",
+      "inputs": {
+        "Duration": "PT1S"
+      }
+    }
+  ],
+  "outputs": [
+    "Preflight.Output",
+    "AuthorAndLinkGPO.Output"
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SsmRunCommandReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommands",
+        "ssm:ListCommandInvocations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "SsmSendCommandScoped",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:<region>::document/AWS-RunPowerShellScript",
+        "arn:aws:ec2:<region>:<account-id>:instance/<source-mgmt-instance-id>",
+        "arn:aws:ec2:<region>:<account-id>:instance/<target-mgmt-instance-id>"
+      ]
+    },
+    {
+      "Sid": "DirectoryRead",
+      "Effect": "Allow",
+      "Action": "ds:DescribeDirectories",
+      "Resource": "arn:aws:ds:<region>:<account-id>:directory/<directory-id>"
+    }
+  ]
+}
