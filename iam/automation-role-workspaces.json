@@ -1,0 +1,66 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkSpacesReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "workspaces:DescribeWorkspaces",
+        "workspaces:DescribeWorkspaceDirectories",
+        "workspaces:DescribeWorkspaceBundles",
+        "workspaces:DescribeTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DirectoryRead",
+      "Effect": "Allow",
+      "Action": "ds:DescribeDirectories",
+      "Resource": "arn:aws:ds:<region>:<account-id>:directory/<directory-id>"
+    },
+    {
+      "Sid": "WorkSpacesCreateOnly",
+      "Effect": "Allow",
+      "Action": [
+        "workspaces:CreateWorkspaces"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ServiceQuotasReadForWorkSpacesPreflight",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:GetServiceQuota",
+        "servicequotas:GetAWSDefaultServiceQuota",
+        "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ServiceQuotasRequestIncreaseOptInOnly",
+      "Effect": "Allow",
+      "Action": [
+        "servicequotas:RequestServiceQuotaIncrease"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KmsForEncryptedWorkspaces",
+      "Effect": "Allow",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:CreateGrant",
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*"
+      ],
+      "Resource": "arn:aws:kms:<region>:<account-id>:key/<workspaces-cmk-key-id>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "workspaces.<region>.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

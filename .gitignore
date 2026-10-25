@@ -1,0 +1,9 @@
+# Local static-analysis output and evidence - NOT for publication.
+# Holds extracted PowerShell/Python, PSScriptAnalyzer results, and the ACAT
+# report bundle. These are internal review artifacts, not part of the sample.
+psa/
+
+# Common local cruft
+.DS_Store
+*.swp
+*~
