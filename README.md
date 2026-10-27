@@ -53,6 +53,18 @@ management instance, and does **not** copy user data or terminate anything.
   `automation-trust.json` is the SSM Automation trust policy (fill in
   `aws:SourceAccount` and `aws:SourceArn`).
 - A target **AWS Managed Microsoft AD** directory, registered with WorkSpaces.
+- **For `FSx-GPO-Orchestrator` (Step 3) only: a group Managed Service Account
+  (gMSA)** in the target Managed AD to author the GPO. The document requires
+  its `gpoAuthorGmsa` parameter and its Preflight hard-fails a `dryRun=false`
+  run if the gMSA is not usable on the box. Before running Step 3:
+  1. Create the gMSA in the target Managed AD (the creating identity must be a
+     member of **AWS Delegated Managed Service Account Administrators**).
+  2. Add the management box to the gMSA's
+     `PrincipalsAllowedToRetrieveManagedPassword`.
+  3. On the management box, run `Install-ADServiceAccount` and confirm with
+     `Test-ADServiceAccount`.
+  4. Delegate GPO create and link rights to the gMSA on `targetOuDn` (and write
+     access on the domain Policies container).
 
 ## Security
 
@@ -80,13 +92,15 @@ reading the rest of this section, you can create unsafe outcomes.
   holds domain-administrator-equivalent credentials. Rotate the passwords and
   delete the secret once the migration completes, and decommission the
   management instance (encrypted root volume, no retained snapshots).
-- **Management-box credential hygiene.** `FSx-GPO-Orchestrator` registers a
-  short-lived scheduled task as the Managed AD Admin, which Windows persists as
-  an LSA secret until the task is unregistered. The document cleans it up, but
-  before snapshotting or handing back the box confirm
-  `Get-ScheduledTask -TaskName 'FsxGpoAuthor'` returns nothing. For the
-  strongest posture, author the GPO with a group Managed Service Account (gMSA)
-  so no password is stored.
+- **GPO authoring uses a gMSA, so no password is stored (T3).**
+  `FSx-GPO-Orchestrator` authors the GPO from a short-lived scheduled task that
+  runs as the group Managed Service Account you supply in `gpoAuthorGmsa` (a
+  required parameter). The task principal uses `-LogonType Password`, but for a
+  gMSA this stores no credential: Task Scheduler retrieves the gMSA password
+  from Active Directory at runtime, so nothing is persisted to the management
+  box or as an LSA secret. The document still unregisters the task on exit; if
+  you want to confirm cleanup before snapshotting or handing back the box,
+  check that `Get-ScheduledTask -TaskName 'FsxGpoAuthor'` returns nothing.
 
 ## Passwords
 
