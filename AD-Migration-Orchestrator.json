@@ -35,7 +35,7 @@
     },
     "useSourceBind": {
       "type": "String",
-      "description": "(Optional) If 'true', the csvde export binds explicitly to the source Simple AD using the secret's source.username/source.password via -b. Use this ONLY when the management box is NOT joined to the source domain. Default 'false' = bind as the Run Command execution identity (correct, tested path when the box is joined to the source domain). The secret may contain a source block without this being set; the explicit -b bind is applied ONLY when useSourceBind=true AND the source creds are present.",
+      "description": "(Optional) If 'true', the source export binds to the source Simple AD using the secret's source.username/source.password. The bind is performed through the LDAP bind API (an authenticated LdapConnection with AuthType=Negotiate), so the password is passed in the authentication call and never appears on a process command line. Use this ONLY when the management box is NOT joined to the source domain. Default 'false' = bind as the Run Command execution identity (the tested path when the box is joined to the source domain). The secret may contain a source block without this being set; the explicit source-credential bind is applied ONLY when useSourceBind=true AND the source creds are present.",
       "default": "false",
       "allowedValues": [
         "true",
